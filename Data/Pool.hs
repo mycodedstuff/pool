@@ -41,7 +41,6 @@ module Data.Pool
     , destroyAllResources
     ) where
 
-import Control.Applicative ((<$>))
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, onException, mask_)
@@ -51,7 +50,10 @@ import Data.IORef (IORef, newIORef, mkWeakIORef)
 import Data.List (partition)
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Typeable (Typeable)
+import Data.Maybe (fromMaybe)
 import GHC.Conc.Sync (labelThread)
+import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
 import qualified Control.Exception as E
 import qualified Data.Vector as V
 
@@ -204,7 +206,8 @@ forkIOLabeledWithUnmask label m = mask_ $ forkIOWithUnmask $ \unmask -> do
 -- have been left idle for too long.
 reaper :: (a -> IO ()) -> NominalDiffTime -> V.Vector (LocalPool a) -> IO ()
 reaper destroy idleTime pools = forever $ do
-  threadDelay (1 * 1000000)
+  t <- fromMaybe 30 <$> ((>>= readMaybe) <$> lookupEnv "POOL_DELAY_SECONDS")
+  threadDelay (t * 1000000)
   now <- getCurrentTime
   let isStale Entry{..} = now `diffUTCTime` lastUse > idleTime
   V.forM_ pools $ \LocalPool{..} -> do
