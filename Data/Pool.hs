@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ScopedTypeVariables, RankNTypes, DeriveDataTypeable #-}
+{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ScopedTypeVariables, RankNTypes, DeriveDataTypeable, TupleSections, LambdaCase #-}
 
 #if MIN_VERSION_monad_control(0,3,0)
 {-# LANGUAGE FlexibleContexts #-}
@@ -39,6 +39,10 @@ module Data.Pool
     , destroyResource
     , putResource
     , destroyAllResources
+    , Entity (..)
+    , Latency (..)
+    , EntityType (..)
+    , withResourceDebug
     ) where
 
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, threadDelay)
@@ -123,6 +127,19 @@ instance Show (Pool a) where
     show Pool{..} = "Pool {numStripes = " ++ show numStripes ++ ", " ++
                     "idleTime = " ++ show idleTime ++ ", " ++
                     "maxResources = " ++ show maxResources ++ "}"
+
+data EntityType = ENTITY_CREATED | ENTITY_REUSED
+
+data Entity a = Entity
+  { entityType :: !EntityType
+  , latency :: !Latency
+  , entity :: !a
+  }
+
+data Latency = Latency
+  { createLatency :: !NominalDiffTime
+  , acquireLatency :: !NominalDiffTime
+  }
 
 -- | Create a striped resource pool.
 --
@@ -258,14 +275,41 @@ withResource ::
 #endif
   => Pool a -> (a -> m b) -> m b
 {-# SPECIALIZE withResource :: Pool a -> (a -> IO b) -> IO b #-}
-withResource pool act = control $ \runInIO -> mask $ \restore -> do
-  (resource, local) <- takeResource pool
-  ret <- restore (runInIO (act resource)) `onException`
+withResource pool act = runWithResource False pool (act . entity)
+#if __GLASGOW_HASKELL__ >= 700
+{-# INLINABLE withResource #-}
+#endif
+
+withResourceDebug ::
+#if MIN_VERSION_monad_control(0,3,0)
+    (MonadBaseControl IO m)
+#else
+    (MonadControlIO m)
+#endif
+  => Pool a -> (Entity a -> m b) -> m b
+{-# SPECIALIZE withResourceDebug :: Pool a -> (Entity a -> IO b) -> IO b #-}
+withResourceDebug = runWithResource True
+#if __GLASGOW_HASKELL__ >= 700
+{-# INLINABLE withResourceDebug #-}
+#endif
+
+runWithResource :: 
+#if MIN_VERSION_monad_control(0,3,0)
+    (MonadBaseControl IO m)
+#else
+    (MonadControlIO m)
+#endif
+  => Bool -> Pool a -> (Entity a -> m b) -> m b
+{-# SPECIALIZE runWithResource :: Bool -> Pool a -> (Entity a -> IO b) -> IO b #-}
+runWithResource debug pool act = control $ \runInIO -> mask $ \restore -> do
+  (resourceEntity, local) <- takeResource debug pool
+  let resource = entity resourceEntity
+  ret <- restore (runInIO (act resourceEntity)) `onException`
             destroyResource pool local resource
   putResource local resource
   return ret
 #if __GLASGOW_HASKELL__ >= 700
-{-# INLINABLE withResource #-}
+{-# INLINABLE runWithResource #-}
 #endif
 
 -- | Take a resource from the pool, following the same results as
@@ -275,20 +319,26 @@ withResource pool act = control $ \runInIO -> mask $ \restore -> do
 -- This function returns both a resource and the @LocalPool@ it came from so
 -- that it may either be destroyed (via 'destroyResource') or returned to the
 -- pool (via 'putResource').
-takeResource :: Pool a -> IO (a, LocalPool a)
-takeResource pool@Pool{..} = do
-  local@LocalPool{..} <- getLocalPool pool
-  resource <- liftBase . join . atomically $ do
-    ents <- readTVar entries
-    case ents of
-      (Entry{..}:es) -> writeTVar entries es >> return (return entry)
-      [] -> do
-        used <- readTVar inUse
-        when (used == maxResources) retry
-        writeTVar inUse $! used + 1
-        return $
-          create `onException` atomically (modifyTVar_ inUse (subtract 1))
-  return (resource, local)
+takeResource :: Bool -> Pool a -> IO (Entity a, LocalPool a)
+takeResource debug pool@Pool{..} = do
+  ((entity, local), totalLatency) <-
+    calculateLatency debug $ do
+      local@LocalPool{..} <- getLocalPool pool
+      entity <- liftBase . join . atomically $ do
+        ents <- readTVar entries
+        case ents of
+          (Entry{..}:es) -> writeTVar entries es >> return (return (mkEntity entry ENTITY_REUSED $ Latency 0 0))
+          [] -> do
+            used <- readTVar inUse
+            when (used == maxResources) retry
+            writeTVar inUse $! used + 1
+            return $ createEntity `onException` atomically (modifyTVar_ inUse (subtract 1))
+      return (entity, local)
+  return (entity {latency = (latency entity) {acquireLatency = totalLatency}}, local)
+  where
+    createEntity = do
+      (conn, latency) <- calculateLatency debug create
+      return $ mkEntity conn ENTITY_CREATED $ Latency latency 0
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE takeResource #-}
 #endif
@@ -394,3 +444,17 @@ modifyTVar_ v f = readTVar v >>= \a -> writeTVar v $! f a
 modError :: String -> String -> a
 modError func msg =
     error $ "Data.Pool." ++ func ++ ": " ++ msg
+
+mkEntity :: a -> EntityType -> Latency -> Entity a
+mkEntity entity _type time =
+  Entity {entityType = _type, latency = time, entity = entity}
+
+calculateLatency :: Bool -> IO a -> IO (a, NominalDiffTime)
+calculateLatency debug io = do
+  if debug
+    then do
+      startTime <- getCurrentTime
+      result <- io
+      endTime <- getCurrentTime
+      return (result, diffUTCTime endTime startTime)
+    else (, 0) <$> io
