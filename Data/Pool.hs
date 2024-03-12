@@ -128,7 +128,7 @@ instance Show (Pool a) where
                     "idleTime = " ++ show idleTime ++ ", " ++
                     "maxResources = " ++ show maxResources ++ "}"
 
-data EntityType = ENTITY_CREATED | ENTITY_REUSED
+data EntityType = ENTITY_CREATED | ENTITY_REUSED deriving (Show)
 
 data Entity a = Entity
   { entityType :: !EntityType
@@ -139,7 +139,7 @@ data Entity a = Entity
 data Latency = Latency
   { createLatency :: !NominalDiffTime
   , acquireLatency :: !NominalDiffTime
-  }
+  } deriving (Show)
 
 -- | Create a striped resource pool.
 --
